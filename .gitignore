@@ -1,0 +1,7 @@
+__pycache__/
+*.pt
+*.npy
+cache/
+artefacts.zip
+.ipynb_checkpoints/
+data/
