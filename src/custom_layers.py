@@ -154,9 +154,18 @@ class FocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, log_probs, targets):
-        ce = F.nll_loss(log_probs, targets, reduction="none",
-                        label_smoothing=self.label_smoothing)
-        pt = torch.exp(-ce)
+        n_classes = log_probs.size(-1)
+
+        # true-class negative log-likelihood; also drives the focal factor
+        nll = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = torch.exp(-nll).clamp(0.0, 1.0)
+
+        if self.label_smoothing > 0.0:
+            eps = self.label_smoothing
+            ce = (1.0 - eps) * nll - (eps / n_classes) * log_probs.sum(dim=1)
+        else:
+            ce = nll
+
         loss = (1.0 - pt) ** self.gamma * ce
         if self.alpha is not None:
             loss = self.alpha[targets] * loss
