@@ -141,7 +141,12 @@ class FocalLoss(nn.Module):
     the focal term a no-op up to a constant. Here CE is per-sample, so
     (1 - p_t)^gamma actually down-weights easy examples as intended.
 
-    Expects `inputs` to be log-probabilities (the model ends in log_softmax).
+    Expects `log_probs` to be log-probabilities (the model ends in log_softmax),
+    so cross-entropy is a gather, not another softmax.
+
+    Label smoothing is applied by hand: F.nll_loss has no `label_smoothing`
+    argument (only F.cross_entropy does), and F.cross_entropy cannot be used
+    here because it would apply softmax a second time.
     """
 
     def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0):
