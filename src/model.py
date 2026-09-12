@@ -125,9 +125,14 @@ class SigWavNet(nn.Module):
             for _ in range(level + 1)])
 
         self.channel_weighting = ChannelWeighting(level + 1)
+        # Normalise the FEATURE axis before the class projection, not the class
+        # axis after it. Upstream ran InstanceNorm1d(affine=False) on conv1_3's
+        # output -- i.e. on the per-class logit channels -- immediately before
+        # global average pooling. That forces every channel to zero mean / unit
+        # variance, so mean(LeakyReLU(.)) collapses to ~0.395 for every class and
+        # the softmax is near-uniform regardless of the input. See README.
+        self.head_norm = nn.LayerNorm(2 * hidden_dim)
         self.conv1_3 = nn.Conv1d(level + 1, n_output, kernel_size=5, stride=1)
-        self.in1_3 = nn.InstanceNorm1d(n_output)
-        self.relu1_3 = nn.LeakyReLU()
 
     # ---------------------------------------------------------------- forward
 
@@ -145,8 +150,9 @@ class SigWavNet(nn.Module):
 
         x = torch.cat(bands, dim=1)                      # (B, level+1, 2*hidden_dim)
         x = self.channel_weighting(x)
-        x = self.relu1_3(self.in1_3(self.conv1_3(x)))
-        return F.log_softmax(x.mean(2), dim=1)
+        x = self.head_norm(x)                            # over features, per band
+        x = self.conv1_3(x)                              # (B, n_output, L)
+        return F.log_softmax(x.mean(2), dim=1)           # GAP -> logits
 
     # ------------------------------------------------------- transfer helpers
 
@@ -154,8 +160,7 @@ class SigWavNet(nn.Module):
         """Swap the class-projection conv for a new task. Wavelet+encoder weights kept."""
         dev = self.conv1_3.weight.device
         self.conv1_3 = nn.Conv1d(self.level + 1, n_output, kernel_size=5, stride=1).to(dev)
-        self.in1_3 = nn.InstanceNorm1d(n_output).to(dev)
-        self.n_output = n_output
+        self.n_output = n_output          # head_norm is task-agnostic, keep it
         return self
 
     def load_pretrained(self, ckpt_path, map_location="cpu", verbose=True):
@@ -179,7 +184,7 @@ class SigWavNet(nn.Module):
                 p.requires_grad = wavelet
         for p in self.conv1ds.parameters():
             p.requires_grad = encoder
-        for m in (self.conv1_3, self.in1_3, self.channel_weighting):
+        for m in (self.conv1_3, self.head_norm, self.channel_weighting):
             for p in m.parameters():
                 p.requires_grad = head
         return self
@@ -189,7 +194,7 @@ class SigWavNet(nn.Module):
         wav = list(self.kernelsG_.parameters()) + list(self.HardThresholdAssymH.parameters())
         if self.kernelsH_ is not self.kernelsG_:
             wav += list(self.kernelsH_.parameters())
-        head = (list(self.conv1_3.parameters()) + list(self.in1_3.parameters())
+        head = (list(self.conv1_3.parameters()) + list(self.head_norm.parameters())
                 + list(self.channel_weighting.parameters()))
         return [
             {"params": wav, "lr": lr_wavelet},

@@ -43,7 +43,7 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def make_loaders(train_ds, val_ds, batch_size, num_workers=4):
+def make_loaders(train_ds, val_ds, batch_size, num_workers=2):
     kw = dict(num_workers=num_workers, pin_memory=torch.cuda.is_available(),
               persistent_workers=num_workers > 0,
               prefetch_factor=4 if num_workers > 0 else None)
@@ -76,10 +76,10 @@ def evaluate_segments(model, loader, device, criterion=None):
 
 def train_model(model, train_ds, val_ds, *, classes, weights=None, epochs=40,
                 batch_size=32, lr_head=2e-3, lr_encoder=1e-3, lr_wavelet=5e-4,
-                weight_decay=1e-4, gamma=0.0, label_smoothing=0.05,
-                mixup_alpha=0.3, freeze_epochs=0, warmup_frac=0.03,
+                weight_decay=3e-5, gamma=0.0, label_smoothing=0.0,
+                mixup_alpha=0.15, freeze_epochs=0, warmup_frac=0.03,
                 min_lr_frac=0.05, grad_clip=5.0, ckpt_path="best.pt",
-                num_workers=4, log_every=100, seed=0):
+                num_workers=2, log_every=100, seed=0):
     """
     freeze_epochs > 0 -> Stage B1: head-only for that many epochs, then unfreeze
     everything (Stage B2). Set to 0 for from-scratch training.
@@ -178,7 +178,7 @@ def train_model(model, train_ds, val_ds, *, classes, weights=None, epochs=40,
     return model, history
 
 
-def build_model(n_output, level=8, hidden_dim=64, n_layers=3, n_channel=32,
+def build_model(n_output, level=6, hidden_dim=64, n_layers=3, n_channel=64,
                 kernel="db10", mode="PerFilter", initHT=1.0, alpha=10.0, dropout=0.1):
     import pywt
     k = np.array(pywt.Wavelet(kernel).filter_bank[0], dtype=np.float32)
