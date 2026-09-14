@@ -20,7 +20,7 @@ group), so build_cache, split_by_group and SegmentDataset work unchanged.
 import os, re, glob
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold
 
 # ------------------------------------------------------------------- EMO-DB
 
@@ -122,9 +122,18 @@ def speaker_folds(df, n_folds=5, seed=42):
     holds out 2 per fold; n_folds=10 is the classic LOSO protocol.
     Yields (fold_name, train_df, test_df).
     """
-    spk = df.groupby("group").agg(label=("label", "first")).reset_index()
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    for k, (tr_i, te_i) in enumerate(skf.split(spk, spk.label), start=1):
+    spk = (df.groupby("group")
+             .agg(label=("label", "first"), n_labels=("label", "nunique"))
+             .reset_index())
+    # Speakers in a SER corpus act every emotion, so there is no speaker-level
+    # label to stratify on. Only stratify when groups are genuinely label-pure.
+    if spk.n_labels.max() == 1 and spk.label.value_counts().min() >= n_folds:
+        splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        it = splitter.split(spk, spk.label)
+    else:
+        splitter = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        it = splitter.split(spk)
+    for k, (tr_i, te_i) in enumerate(it, start=1):
         tr_spk, te_spk = set(spk.group[tr_i]), set(spk.group[te_i])
         yield (f"fold{k}",
                df[df.group.isin(tr_spk)].reset_index(drop=True),
