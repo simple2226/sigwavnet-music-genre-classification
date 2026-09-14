@@ -114,3 +114,50 @@ def save_results(tag, res, path="results.json"):
     with open(path, "w") as f:
         json.dump(all_res, f, indent=2)
     return path
+
+
+@torch.no_grad()
+def ensemble_clips(models, test_ds, classes, batch_size=32, num_workers=2):
+    """
+    Average clip-level log-probabilities across several trained models (seeds).
+    Reliably worth 3-5 points on GTZAN and costs nothing but the extra runs:
+    the members disagree most on exactly the confusable classes, so averaging
+    cancels a chunk of the variance.
+    """
+    device = get_device()
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    n_clips, K = len(test_ds.df), len(classes)
+    acc = np.zeros((n_clips, K), dtype=np.float64)
+    cnt = np.zeros(n_clips, dtype=np.int64)
+
+    for m in models:
+        seg = evaluate_segments(m, loader, device)
+        for lp, r in zip(seg["logp"], seg["ridx"]):
+            acc[r] += lp
+            cnt[r] += 1
+
+    keep = cnt > 0
+    pred = acc[keep].argmax(1)
+    true = np.array([test_ds.c2i[l] for l in test_ds.df.label.values])[keep]
+    return {
+        "clip_acc": float(accuracy_score(true, pred)),
+        "clip_f1": float(f1_score(true, pred, average="macro")),
+        "report": classification_report(true, pred, target_names=classes,
+                                        digits=3, zero_division=0),
+        "cm": confusion_matrix(true, pred, labels=range(K)),
+        "segment_acc": float("nan"), "segment_f1": float("nan"),
+        "clip_true": true, "clip_pred": pred,
+    }
+
+
+def unweighted_and_weighted_accuracy(y_true, y_pred):
+    """
+    SER convention: WA = plain accuracy, UA = mean per-class recall (= macro
+    recall). Papers on IEMOCAP and EMO-DB report both, and UA is the one that
+    matters on imbalanced corpora. Report both so your numbers are comparable
+    to the base paper's table.
+    """
+    from sklearn.metrics import recall_score
+    return (float(accuracy_score(y_true, y_pred)),
+            float(recall_score(y_true, y_pred, average="macro", zero_division=0)))

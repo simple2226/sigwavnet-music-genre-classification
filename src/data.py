@@ -73,7 +73,7 @@ def index_ravdess(root):
 
 # --------------------------------------------------------------------- cache
 
-def build_cache(df, cache_dir, sr=SR, verbose=True):
+def build_cache(df, cache_dir, sr=SR, verbose=True, max_seconds=None):
     """
     Resample every clip to 16 kHz mono float32, memo as .npy, and record each
     clip's length plus its global mean/std for normalisation at load time.
@@ -103,7 +103,13 @@ def build_cache(df, cache_dir, sr=SR, verbose=True):
                 if in_sr not in resamplers:
                     resamplers[in_sr] = torchaudio.transforms.Resample(in_sr, sr)
                 w = resamplers[in_sr](w)
-            np.save(out, w.squeeze(0).numpy().astype(np.float32))
+            a = w.squeeze(0).numpy().astype(np.float32)
+            if max_seconds is not None:              # keep the centre only
+                keep = int(max_seconds * sr)
+                if a.shape[0] > keep:
+                    off = (a.shape[0] - keep) // 2
+                    a = a[off:off + keep]
+            np.save(out, a)
             stats.pop(key, None)
 
         if key not in stats:
@@ -146,13 +152,18 @@ class SegmentDataset(Dataset):
     """
 
     def __init__(self, df, classes, seg_sec=3.0, hop_sec=1.5, sr=SR,
-                 train=True, augment=True, repeats=1):
+                 train=True, augment=True, repeats=1, speed_perturb=0.0):
         self.df = df.reset_index(drop=True)
         self.classes = list(classes)
         self.c2i = {c: i for i, c in enumerate(self.classes)}
         self.seg_len = int(seg_sec * sr)
         self.train = train
         self.augment = augment and train
+        # speed_perturb = p: with probability p, resample the crop by a random
+        # factor in [0.9, 1.1]. This shifts tempo AND pitch together, like a
+        # record played off-speed. Standard for music, worth 2-4 points on GTZAN;
+        # leave it at 0 for speech, where formant shifts change the label space.
+        self.speed_perturb = speed_perturb if train else 0.0
         self._rng = None                       # created lazily, once per worker
 
         if train:
@@ -186,9 +197,21 @@ class SegmentDataset(Dataset):
     def _load(self, ridx, off):
         arr = np.load(self.df.npy[ridx], mmap_mode="r")
         n = arr.shape[0]
+
+        want = self.seg_len
+        rate = 1.0
+        if self.speed_perturb > 0 and self.rng.random() < self.speed_perturb:
+            rate = float(self.rng.uniform(0.9, 1.1))
+            want = int(round(self.seg_len * rate))
+
         if off is None:
-            off = 0 if n <= self.seg_len else int(self.rng.integers(0, n - self.seg_len + 1))
-        seg = np.array(arr[off:off + self.seg_len], dtype=np.float32)
+            off = 0 if n <= want else int(self.rng.integers(0, n - want + 1))
+        seg = np.array(arr[off:off + want], dtype=np.float32)
+
+        if rate != 1.0 and seg.shape[0] > 1:      # linear resample back to seg_len
+            src = np.linspace(0.0, seg.shape[0] - 1, self.seg_len, dtype=np.float32)
+            seg = np.interp(src, np.arange(seg.shape[0], dtype=np.float32),
+                            seg).astype(np.float32)
         if seg.shape[0] < self.seg_len:                   # wrap-pad short clips
             reps = int(np.ceil(self.seg_len / max(seg.shape[0], 1)))
             seg = np.tile(seg, reps)[:self.seg_len]
@@ -217,3 +240,35 @@ def class_weights(df, classes):
     counts = df.label.value_counts().reindex(classes).fillna(0).values.astype(np.float32)
     w = counts.sum() / (len(classes) * np.maximum(counts, 1))
     return torch.tensor(w, dtype=torch.float32)
+
+
+# ------------------------------------------------------------------- FMA
+
+FMA_SMALL_GENRES = ["Electronic", "Experimental", "Folk", "Hip-Hop",
+                    "Instrumental", "International", "Pop", "Rock"]
+
+
+def index_fma(audio_root, meta_csv, subset="small"):
+    """
+    FMA (https://github.com/mdeff/fma) as a MUSIC source domain for pretraining.
+    fma_small is 8000 30 s clips over 8 balanced genres -- an order of magnitude
+    more music than GTZAN, and far closer to the target domain than RAVDESS.
+
+      audio_root : extracted fma_small/   (000/000002.mp3, 001/..., ...)
+      meta_csv   : fma_metadata/tracks.csv  (two-row header, hence header=[0,1])
+    """
+    tracks = pd.read_csv(meta_csv, index_col=0, header=[0, 1], low_memory=False)
+    sel = tracks[tracks[("set", "subset")] == subset]
+    rows = []
+    for tid, genre in sel[("track", "genre_top")].items():
+        if not isinstance(genre, str):
+            continue
+        p = os.path.join(audio_root, f"{tid // 1000:03d}", f"{tid:06d}.mp3")
+        if os.path.exists(p):
+            rows.append({"path": p, "label": genre,
+                         "clip_id": f"{tid:06d}", "group": f"{tid:06d}"})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise FileNotFoundError(f"no FMA mp3s under {audio_root}")
+    print(f"[fma] {len(df)} tracks | {df.label.nunique()} genres")
+    return df
