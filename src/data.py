@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Data pipeline for Stage A (RAVDESS speech emotion) and Stage B (GTZAN genres).
+Data pipeline for Stage A (FMA-small music genres) and Stage B (GTZAN genres).
+
+Both stages are MUSIC GENRE corpora, so the pre-training source and the target
+task share a domain. An earlier version pre-trained on RAVDESS (speech emotion);
+that is a different domain and it did not transfer.
 
 Design notes worth defending in the presentation:
 
-  * SPLIT BY CLIP, NEVER BY SEGMENT. A 30 s GTZAN track chopped into 3 s windows
-    yields ~19 near-identical segments. Splitting those at random puts siblings
-    in both train and test and inflates accuracy by 10-20 points. Every split
-    here is on the clip id, stratified by class.
-  * RAVDESS is split BY ACTOR, so Stage A is speaker-independent like the paper.
+  * SPLIT BY CLIP, NEVER BY SEGMENT. A 30 s GTZAN track chopped into 5 s windows
+    yields ~11 overlapping, near-identical segments. Splitting those at random
+    puts siblings in both train and test and inflates accuracy by 10-20 points.
+    Every split here is on the clip id, stratified by class.
   * Waveforms are cached once as 16 kHz mono float32 .npy, then windowed on the
-    fly. Decoding a 30 s wav per __getitem__ is the actual bottleneck otherwise.
+    fly. Decoding a 30 s track per __getitem__ is the actual bottleneck otherwise.
   * `repeats` controls how many random crops each clip contributes per epoch.
     With repeats=1 and 700 training clips an "epoch" is 43 batches — nowhere
     near enough optimizer steps to converge. repeats=10 means each epoch sees
@@ -22,6 +25,7 @@ Design notes worth defending in the presentation:
 """
 
 import os, glob, hashlib, json
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import torch
@@ -73,11 +77,61 @@ def index_ravdess(root):
 
 # --------------------------------------------------------------------- cache
 
-def build_cache(df, cache_dir, sr=SR, verbose=True, max_seconds=None):
+def _load_any(path, sr):
+    """
+    Decode one audio file to 16 kHz mono float32.
+
+    torchaudio first; librosa/audioread as a fallback. The fallback is not
+    optional for FMA: its archive is mp3, and roughly a hundred of its files are
+    truncated or have a broken header, which torchaudio raises on but audioread
+    usually recovers.
+    """
+    try:
+        w, in_sr = torchaudio.load(path)
+        a = w.mean(0).numpy().astype(np.float32)
+        if in_sr != sr:
+            a = torchaudio.functional.resample(
+                torch.from_numpy(a), in_sr, sr).numpy().astype(np.float32)
+        if a.size == 0:
+            raise RuntimeError("decoded to zero samples")
+        return a
+    except Exception:
+        import librosa
+        a, _ = librosa.load(path, sr=sr, mono=True)
+        a = np.asarray(a, dtype=np.float32)
+        if a.size == 0:
+            raise RuntimeError("decoded to zero samples")
+        return a
+
+
+def _cache_one(args):
+    """Worker: decode -> optional centre crop -> save .npy -> return stats."""
+    path, out, sr, max_seconds = args
+    try:
+        if not os.path.exists(out):
+            a = _load_any(path, sr)
+            if max_seconds is not None:               # keep the centre only
+                keep = int(max_seconds * sr)
+                if a.shape[0] > keep:
+                    off = (a.shape[0] - keep) // 2
+                    a = a[off:off + keep]
+            tmp = out + ".tmp.npy"                    # atomic: no half-written file
+            np.save(tmp, a)
+            os.replace(tmp, out)
+        arr = np.asarray(np.load(out, mmap_mode="r"), dtype=np.float32)
+        return out, [int(arr.shape[0]), float(arr.mean()), float(arr.std() + 1e-8)], None
+    except Exception as e:
+        return out, None, f"{os.path.basename(path)}: {type(e).__name__}"
+
+
+def build_cache(df, cache_dir, sr=SR, verbose=True, max_seconds=None, workers=None):
     """
     Resample every clip to 16 kHz mono float32, memo as .npy, and record each
     clip's length plus its global mean/std for normalisation at load time.
-    Stats are themselves cached in _stats.json so re-running is instant.
+    Stats are cached in _stats.json so re-running is instant.
+
+    Decoding is the wall-clock bottleneck (8000 FMA mp3s single-threaded is well
+    over half an hour), so it runs in a process pool.
     """
     os.makedirs(cache_dir, exist_ok=True)
     stats_path = os.path.join(cache_dir, "_stats.json")
@@ -86,48 +140,49 @@ def build_cache(df, cache_dir, sr=SR, verbose=True, max_seconds=None):
     except (FileNotFoundError, json.JSONDecodeError):
         stats = {}
 
-    npy, lengths, means, stds, bad = [], [], [], [], []
-    resamplers = {}
-    for i, row in enumerate(df.itertuples()):
-        key = hashlib.md5(row.path.encode()).hexdigest()[:16]
-        out = os.path.join(cache_dir, key + ".npy")
-        if not os.path.exists(out):
-            try:
-                w, in_sr = torchaudio.load(row.path)
-            except Exception as e:                       # GTZAN ships one corrupt wav
-                bad.append((row.path, repr(e)))
-                npy.append(None); lengths.append(0); means.append(0.0); stds.append(1.0)
-                continue
-            w = w.mean(0, keepdim=True)
-            if in_sr != sr:
-                if in_sr not in resamplers:
-                    resamplers[in_sr] = torchaudio.transforms.Resample(in_sr, sr)
-                w = resamplers[in_sr](w)
-            a = w.squeeze(0).numpy().astype(np.float32)
-            if max_seconds is not None:              # keep the centre only
-                keep = int(max_seconds * sr)
-                if a.shape[0] > keep:
-                    off = (a.shape[0] - keep) // 2
-                    a = a[off:off + keep]
-            np.save(out, a)
-            stats.pop(key, None)
+    outs = [os.path.join(cache_dir, hashlib.md5(p.encode()).hexdigest()[:16] + ".npy")
+            for p in df.path]
 
-        if key not in stats:
-            arr = np.asarray(np.load(out, mmap_mode="r"), dtype=np.float32)
-            stats[key] = [int(arr.shape[0]), float(arr.mean()), float(arr.std() + 1e-8)]
-        n, mu, sd = stats[key]
-        npy.append(out); lengths.append(n); means.append(mu); stds.append(sd)
-        if verbose and (i + 1) % 200 == 0:
-            print(f"  cached {i+1}/{len(df)}")
+    todo = [(p, o, sr, max_seconds) for p, o in zip(df.path, outs)
+            if o not in stats or not os.path.exists(o)]
 
-    json.dump(stats, open(stats_path, "w"))
+    bad = []
+    if todo:
+        workers = workers or min(8, (os.cpu_count() or 2) * 2)
+        if verbose:
+            print(f"[cache] decoding {len(todo)} file(s) with {workers} worker(s)")
+        done = 0
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_cache_one, t) for t in todo]
+            for fut in as_completed(futures):
+                out, st, err = fut.result()
+                if err:
+                    bad.append(err)
+                    stats.pop(out, None)
+                else:
+                    stats[out] = st
+                done += 1
+                if verbose and done % 500 == 0:
+                    print(f"  cached {done}/{len(todo)}")
+        json.dump(stats, open(stats_path, "w"))
+
+    npy, lengths, means, stds = [], [], [], []
+    for out in outs:
+        st = stats.get(out)
+        if st is None or not os.path.exists(out):
+            npy.append(None); lengths.append(0); means.append(0.0); stds.append(1.0)
+        else:
+            npy.append(out); lengths.append(st[0]); means.append(st[1]); stds.append(st[2])
+
     df = df.copy()
     df["npy"], df["n_samples"] = npy, lengths
     df["clip_mean"], df["clip_std"] = means, stds
+    kept = df[df.npy.notna() & (df.n_samples > 0)].reset_index(drop=True)
     if bad:
-        print(f"[cache] skipped {len(bad)} unreadable file(s): "
-              f"{[os.path.basename(b[0]) for b in bad]}")
-    return df[df.npy.notna() & (df.n_samples > 0)].reset_index(drop=True)
+        print(f"[cache] skipped {len(bad)} undecodable file(s), e.g. {bad[:3]}")
+    if verbose:
+        print(f"[cache] {len(kept)}/{len(df)} clips usable in {cache_dir}")
+    return kept
 
 
 # --------------------------------------------------------------------- split
@@ -282,16 +337,23 @@ def index_fma(audio_root, meta_csv, subset="small"):
     """
     tracks = pd.read_csv(meta_csv, index_col=0, header=[0, 1], low_memory=False)
     sel = tracks[tracks[("set", "subset")] == subset]
-    rows = []
+    rows, missing = [], 0
     for tid, genre in sel[("track", "genre_top")].items():
         if not isinstance(genre, str):
             continue
-        p = os.path.join(audio_root, f"{tid // 1000:03d}", f"{tid:06d}.mp3")
-        if os.path.exists(p):
-            rows.append({"path": p, "label": genre,
-                         "clip_id": f"{tid:06d}", "group": f"{tid:06d}"})
+        stem = os.path.join(audio_root, f"{tid // 1000:03d}", f"{tid:06d}")
+        p = next((stem + ext for ext in (".mp3", ".wav") if os.path.exists(stem + ext)), None)
+        if p is None:
+            missing += 1
+            continue
+        rows.append({"path": p, "label": genre,
+                     "clip_id": f"{tid:06d}", "group": f"{tid:06d}"})
     df = pd.DataFrame(rows)
     if df.empty:
-        raise FileNotFoundError(f"no FMA mp3s under {audio_root}")
-    print(f"[fma] {len(df)} tracks | {df.label.nunique()} genres")
+        raise FileNotFoundError(
+            f"no FMA audio under {audio_root} — expected {audio_root}/000/000002.mp3")
+    if missing:
+        print(f"[fma] {missing} track(s) listed in metadata but absent on disk")
+    print(f"[fma] {len(df)} tracks | {df.label.nunique()} genres "
+          f"| {df.label.value_counts().to_dict()}")
     return df
