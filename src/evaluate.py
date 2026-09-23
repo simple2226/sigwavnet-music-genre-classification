@@ -117,12 +117,17 @@ def save_results(tag, res, path="results.json"):
 
 
 @torch.no_grad()
-def ensemble_clips(models, test_ds, classes, batch_size=32, num_workers=2):
+def ensemble_clips(models, test_ds, classes, batch_size=32, num_workers=2,
+                   weights=None):
     """
     Average clip-level log-probabilities across several trained models (seeds).
-    Reliably worth 3-5 points on GTZAN and costs nothing but the extra runs:
-    the members disagree most on exactly the confusable classes, so averaging
-    cancels a chunk of the variance.
+    The members disagree most on exactly the confusable classes, so averaging
+    cancels part of the variance.
+
+    `weights` optionally scales each member's contribution -- pass each model's
+    validation macro-F1 when the members differ in quality, so a weak seed does
+    not drag a strong one down. Weights are normalised internally, and equal
+    weights reproduce the plain average.
     """
     device = get_device()
     loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
@@ -131,10 +136,19 @@ def ensemble_clips(models, test_ds, classes, batch_size=32, num_workers=2):
     acc = np.zeros((n_clips, K), dtype=np.float64)
     cnt = np.zeros(n_clips, dtype=np.int64)
 
-    for m in models:
+    if weights is None:
+        weights = [1.0] * len(models)
+    if len(weights) != len(models):
+        raise ValueError(f"{len(weights)} weights for {len(models)} models")
+    w = np.asarray(weights, dtype=np.float64)
+    if w.min() < 0:
+        raise ValueError("ensemble weights must be non-negative")
+    w = w / w.sum() * len(models)          # mean 1, so scale matches the plain average
+
+    for m, wi in zip(models, w):
         seg = evaluate_segments(m, loader, device)
         for lp, r in zip(seg["logp"], seg["ridx"]):
-            acc[r] += lp
+            acc[r] += wi * lp
             cnt[r] += 1
 
     keep = cnt > 0
